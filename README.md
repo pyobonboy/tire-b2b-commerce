@@ -1,12 +1,27 @@
-# tire-b2b-commerce — 타이어 B2B 마켓플레이스
+<div align="center">
 
-> 판매자와 구매자 모두 승인제로 운영하는 타이어 B2B 오픈마켓. 주문, 토스페이먼츠 결제, 부분환불, 반품·교환, 판매자 정산, 세금계산서까지 다룬다.
+# tire-b2b-commerce
+
+**타이어 B2B 마켓플레이스**
+
+판매자와 구매자 모두 승인제로 운영하는 타이어 B2B 오픈마켓. 주문, 토스페이먼츠 결제, 부분환불, 반품·교환, 판매자 정산, 세금계산서까지 다룬다.
 
 ![Next.js](https://img.shields.io/badge/Next.js-16-000000?style=flat-square&logo=nextdotjs&logoColor=white) ![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white) ![Prisma](https://img.shields.io/badge/Prisma-6-2D3748?style=flat-square&logo=prisma&logoColor=white) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Supabase_or_Render-4169E1?style=flat-square&logo=postgresql&logoColor=white) ![NextAuth](https://img.shields.io/badge/NextAuth-4-6C47FF?style=flat-square&logoColor=white) ![Toss Payments](https://img.shields.io/badge/Toss_Payments-SDK_v2-0064FF?style=flat-square&logoColor=white)
 
-- **문제**: 구매자와 판매자가 모두 사업자인 거래에서는 결제 1건에 여러 주문이 묶이고 취소·환불·정산이 이어져, 동시 요청과 외부 결제 API 실패가 돈과 재고 상태를 쉽게 어긋나게 한다.
-- **해결**: 외부 결제 API는 트랜잭션 밖에서 호출하고, 상태 전이는 기대 상태를 조건으로 건 `updateMany`로 처리하며, 금액은 서버가 정한다. 자동 환불이 실패하면 기록을 남겨 사람이 이어받게 했다.
-- **내 역할**: 1인 프로젝트로 설계, 구현, 검증, 배포를 전담했다(원본 커밋 127개, 2026-07-23 ~ 2026-09-01).
+[핵심 기술 과제](#핵심-기술-과제와-해결) · [아키텍처](#아키텍처) · [실행 방법](#실행-방법) · [회고](#회고와-개선-과제)
+
+</div>
+
+| 기간 | 역할 | 규모 | 테스트 | 배포 |
+|:---:|:---:|:---:|:---:|:---:|
+| 2026.07 – 2026.09 | 1인 · 설계·구현·검증·배포 전담 | 원본 커밋 127 · 페이지 59 · route handler 74 | 자동화 테스트 없음 · 타입 검사 · 린트 · PGlite 하네스 | Vercel + Supabase, Render |
+
+> [!IMPORTANT]
+> **문제** — 구매자와 판매자가 모두 사업자인 거래에서는 결제 1건에 여러 주문이 묶이고 취소·환불·정산이 이어져, 동시 요청과 외부 결제 API 실패가 돈과 재고 상태를 쉽게 어긋나게 한다.
+>
+> **해결** — 외부 결제 API는 트랜잭션 밖에서 호출하고, 상태 전이는 기대 상태를 조건으로 건 `updateMany`로 처리하며, 금액은 서버가 정한다. 자동 환불이 실패하면 기록을 남겨 사람이 이어받게 했다.
+>
+> **내 역할** — 1인 프로젝트로 설계, 구현, 검증, 배포를 전담했다(원본 커밋 127개, 2026-07-23 ~ 2026-09-01).
 
 ## 프로젝트 개요
 
@@ -96,6 +111,14 @@ flowchart LR
 그 밖에 Tailwind CSS 4, Radix UI, bcryptjs, AWS SDK v3(S3 클라이언트와 presigner)를 쓴다.
 
 ## 핵심 기술 과제와 해결
+
+| # | 과제 | 핵심 기법 |
+|:-:|---|---|
+| 1 | [외부 결제 API는 트랜잭션 밖에서 호출](#1-외부-결제-api는-트랜잭션-밖에서-호출) | 트랜잭션에서는 DB 쓰기만 · 커밋한 뒤 토스 취소 API 호출 · 주문 단위 멱등키(`order-cancel-refund:<orderId>`) |
+| 2 | [부분환불 자동화와 과다환불 방지](#2-부분환불-자동화와-과다환불-방지) | 로컬 잔액을 계산해 클램프 · 마지막 주문은 `cancelAmount` 생략 · 자동 환불 실패 표식을 sticky로 남기기 |
+| 3 | [결제 승인 후 DB 반영 실패 복구 상태 설계](#3-결제-승인-후-db-반영-실패-복구-상태-설계) | 실패 지점별로 상태 분리 · HTTP 202 `PAYMENT_CONFIRM_PENDING_RECONCILIATION` 응답 · 승인 사실조차 기록하지 못하면 토스 자동 취소 |
+| 4 | [서명 없는 웹훅의 안전한 처리](#4-서명-없는-웹훅의-안전한-처리) | 공유 비밀값을 `timingSafeEqual`로 비교 · 비밀값이 없으면 503 · 바디를 믿지 않고 토스 API에서 다시 읽기 |
+| 5 | [상태 전이 경합 방지와 서버 결정 가격](#5-상태-전이-경합-방지와-서버-결정-가격) | 기대 상태를 `where`에 건 `updateMany` · 반환된 `count` 검사 · 가격과 배송비를 서버가 결정 |
 
 ### 1. 외부 결제 API는 트랜잭션 밖에서 호출
 
@@ -187,6 +210,9 @@ npm run dev
 
 Next.js는 `.env.local`을, Prisma CLI는 `.env`를 읽으므로 `DATABASE_URL`은 두 파일에 모두 있어야 한다. 값은 저장소에 커밋하지 않는다.
 
+<details>
+<summary><b>환경 변수 표 펼치기</b></summary>
+
 | 변수 | 용도 |
 | --- | --- |
 | `DATABASE_URL` | 런타임 쿼리용 Postgres 주소. Supabase에서는 transaction pooler 주소(포트 6543)에 `?pgbouncer=true&connection_limit=1`을 붙인다 |
@@ -200,6 +226,8 @@ Next.js는 `.env.local`을, Prisma CLI는 `.env`를 읽으므로 `DATABASE_URL`�
 | `TRUSTED_PROXY_HOPS` | 앞단 리버스 프록시 개수(Render, Vercel 모두 1). 레이트리밋이 클라이언트 IP를 고르는 데 쓴다 |
 | `SEED_*` | 시드 스크립트 옵션. 데모 계정은 `SEED_DEMO_USERS=true`일 때만 만들고 `NODE_ENV=production`에서는 거부한다 |
 
+</details>
+
 데모 계정의 로그인 ID는 `admin`, `buyer`, `seller`이다. 비밀번호는 `SEED_ADMIN_PASSWORD`, `SEED_DEMO_BUYER_PASSWORD`, `SEED_DEMO_SELLER_PASSWORD`로 정하고, 지정하지 않으면 개발 환경에서만 코드 기본값을 쓴다. 시드 스크립트는 타이어 카탈로그([`src/lib/mockData.ts`](src/lib/mockData.ts))도 함께 넣는다.
 
 결제 화면은 구매자로 로그인해 주문을 만들고 주문 목록에서 결제하기를 누르면 열린다. 본인 토스 계정의 API 개별 연동 test 키가 필요하다. 웹훅 등록, 이미지 스토리지, Vercel + Supabase 배포 절차는 [`docs/deployment.md`](docs/deployment.md)에 있다.
@@ -212,6 +240,9 @@ Next.js는 `.env.local`을, Prisma CLI는 `.env`를 읽으므로 `DATABASE_URL`�
 - 빌드, 타입체크, 린트를 통과하고도 실제 DB 데이터에서 틀린 변경이 여러 번 나왔기 때문에, 이 통과는 기준선일 뿐 검증의 증거로 보지 않았다.
 
 ## 폴더 구조
+
+<details>
+<summary><b>폴더 트리 펼치기</b></summary>
 
 ```text
 tire-b2b-commerce/
@@ -234,6 +265,8 @@ tire-b2b-commerce/
 ├── vercel.json         # Vercel 리전(icn1)
 └── package.json
 ```
+
+</details>
 
 ### 관련 문서
 
@@ -259,3 +292,11 @@ tire-b2b-commerce/
 - **법정 표시와 약관**: 푸터의 법정 표시사항이 더미값이고 약관 4종은 초안이다. 서비스 개시 전에 실제 값과 법무 검토가 필요하다.
 - **실물 검증 공백**: 웹훅 실제 페이로드, 할부 결제와 할부 부분취소, 이미지 업로드는 아직 실물로 검증하지 못했다([`docs/verification.md`](docs/verification.md)).
 - **알림 채널**: 이메일이나 SMS 같은 알림 채널이 연결되어 있지 않다. [`src/lib/server/notify.ts`](src/lib/server/notify.ts)의 기본 구현은 아무것도 전송하지 않는다.
+
+---
+
+<div align="center">
+
+[다른 프로젝트 보기](https://github.com/pyobonboy) · [pyobon07@naver.com](mailto:pyobon07@naver.com)
+
+</div>
