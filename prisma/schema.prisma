@@ -1,0 +1,618 @@
+generator client {
+  provider      = "prisma-client-js"
+  // "debian-openssl-3.0.x" is Render's runtime; "rhel-openssl-3.0.x" is
+  // Vercel's Lambda runtime. Without the rhel target, every request 500s
+  // after a Vercel deploy because the query engine binary is missing.
+  binaryTargets = ["native", "debian-openssl-3.0.x", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  // Runtime queries use the pooler address (DATABASE_URL, Supabase
+  // Supavisor port 6543, transaction mode). Migrations use the direct
+  // address (DIRECT_URL, port 5432) because pooled transaction-mode
+  // connections don't support the session-level statements migrations need.
+  // On platforms without a pooler (Render, local dev), just set both env
+  // vars to the same connection string.
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  BUYER
+  SELLER
+  ADMIN
+}
+
+enum SellerStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+enum BuyerStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  REJECTED
+}
+
+enum PaymentStatus {
+  READY
+  DONE
+  FAILED
+  CANCELED
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING
+  ACTIVE
+  REJECTED
+  SOLDOUT
+  HIDDEN
+}
+
+model User {
+  id                   String    @id @default(cuid())
+  loginId              String    @unique
+  passwordHash         String
+  role                 Role
+  email                String?
+  notifyOptIn          Boolean   @default(true)
+  createdAt            DateTime  @default(now())
+  withdrawnAt          DateTime?
+  // Set whenever the password changes (see consumePasswordReset in
+  // src/lib/server/passwordReset.ts). getSession() refuses any JWT issued
+  // before this instant, which is what actually signs an intruder out when
+  // the owner resets their password — sessions are JWTs, so the token itself
+  // is unaware the password moved. Null means the password has never been
+  // changed since this column existed, and nothing is invalidated.
+  passwordChangedAt    DateTime?
+
+  businessName         String
+  // Uniqueness is scoped to real, still-registerable numbers only: withdrawAccount
+  // (see src/lib/server/account.ts) rewrites this to a tombstone value of the
+  // form "WITHDRAWN#<userId>" before soft-deleting the account, so a plain
+  // unique index (rather than a partial one limited to active rows) is enough
+  // — the tombstoned value can never collide with a real checksum-valid
+  // 10-digit registration number (which is all-digits) or with another
+  // user's tombstone (each is suffixed with that user's own cuid). This also
+  // frees the original number for a genuinely different business to register
+  // once the withdrawn account no longer holds it. See businessRegNumber.ts
+  // for the format + checksum validation applied at signup.
+  businessRegNumber    String    @unique
+  businessType         String?
+  businessCategory     String?
+  ownerName            String
+
+  postalCode            String?
+  address               String?
+  officePhone           String?
+  mobilePhone           String
+  contact1              String?
+  contact2              String?
+
+  bankName              String?
+  bankAccountNumber     String?
+  bankAccountHolder     String?
+  bankAccountVerifiedAt DateTime?
+
+  seller        Seller?
+  buyer         Buyer?
+  orders        Order[]
+  payments      Payment[]
+  cartItems     CartItem[]
+  wishlist      WishlistEntry[]
+  passwordResetTokens PasswordResetToken[]
+  shippingAddresses   ShippingAddress[]
+  reviews             Review[]
+  inquiries           Inquiry[]
+  returnRequests      ReturnRequest[]
+  taxInvoices         TaxInvoice[]
+}
+
+// Account recovery (아이디 찾기 / 비밀번호 재설정) — see src/lib/server/passwordReset.ts
+// for the full design rationale. Only a hash of the one-time token is ever
+// stored, mirroring why User.passwordHash exists instead of a plaintext
+// password: a stolen row from this table must not be directly usable to take
+// over the account.
+model PasswordResetToken {
+  id         String    @id @default(cuid())
+  user       User      @relation(fields: [userId], references: [id])
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  // Set once the token is redeemed (or superseded by a newer request for the
+  // same user); a non-null value means "can never be used again" regardless
+  // of expiresAt, which is what makes single-use enforcement possible.
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Seller {
+  id            String       @id @default(cuid())
+  user          User         @relation(fields: [userId], references: [id])
+  userId        String       @unique
+  code          String       @unique
+  status        SellerStatus @default(PENDING)
+  courier       String
+  shippingNote  String?
+  location      String?
+  intro         String?
+  approvedAt    DateTime?
+  approvedBy    String?
+  suspendReason String?
+
+  // 배송비 정책. 주문 1건(= 이 판매자에게 가는 한 건)당 부과되며, 주문 시점의
+  // 값이 Order.shippingFee 로 스냅샷된다 — 나중에 판매자가 정책을 바꿔도 이미
+  // 접수된 주문의 청구액이 흔들리면 안 되기 때문이다.
+  // freeShippingThreshold 가 null 이면 무료배송 기준 없음.
+  shippingFee            Int  @default(0)
+  freeShippingThreshold  Int?
+
+  // 플랫폼 수수료율(%). 정산 시 Settlement.commissionAmount 계산에 쓰이고,
+  // 그 값 역시 정산 시점에 스냅샷된다.
+  commissionRate Decimal @default(0) @db.Decimal(5, 2)
+
+  listings              Listing[]
+  settlements           Settlement[]
+  reviews               Review[]
+  settlementAdjustments SettlementAdjustment[]
+}
+
+model Buyer {
+  id             String      @id @default(cuid())
+  user           User        @relation(fields: [userId], references: [id])
+  userId         String      @unique
+  status         BuyerStatus @default(PENDING)
+  approvedAt     DateTime?
+  approvedBy     String?
+  rejectedReason String?
+  suspendReason  String?
+}
+
+model Product {
+  id           String   @id @default(cuid())
+  manufacturer String
+  model        String
+  width        Int
+  ratio        Int
+  rim          Int
+  createdAt    DateTime @default(now())
+
+  listings Listing[]
+
+  @@unique([manufacturer, model, width, ratio, rim])
+}
+
+model Listing {
+  id             String        @id @default(cuid())
+  product        Product       @relation(fields: [productId], references: [id])
+  productId      String
+  seller         Seller        @relation(fields: [sellerId], references: [id])
+  sellerId       String
+  status         ListingStatus @default(DRAFT)
+  rejectedReason String?
+
+  dot         String
+  loadIndex   String
+  speedIndex  String
+  ply         String
+  oe          String?
+  season      String
+  productCode String
+
+  discountRate Decimal @db.Decimal(5, 2)
+  price        Int
+  factoryPrice Int
+  stock        Int      @default(0)
+  minOrder     Int      @default(1)
+  tag          String?
+
+  images       ListingImage[]
+  priceHistory ListingPriceChange[]
+  orders       Order[]
+  cartItems    CartItem[]
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  submittedAt  DateTime?
+  reviewedAt   DateTime?
+  reviewedBy   String?
+
+  @@index([productId, status])
+}
+
+model ListingPriceChange {
+  id        String   @id @default(cuid())
+  listing   Listing  @relation(fields: [listingId], references: [id])
+  listingId String
+  field     String
+  oldValue  String
+  newValue  String
+  changedBy String
+  changedAt DateTime @default(now())
+}
+
+model AdminActionLog {
+  id         String   @id @default(cuid())
+  adminId    String
+  action     String
+  targetType String
+  targetId   String
+  reason     String?
+  createdAt  DateTime @default(now())
+}
+
+model Payment {
+  id               String        @id @default(cuid())
+  tossOrderId      String        @unique
+  buyer            User          @relation(fields: [buyerId], references: [id])
+  buyerId          String
+  amount           Int
+  status           PaymentStatus @default(READY)
+  paymentKey       String?
+  method           String?
+  requestedAt      DateTime      @default(now())
+  approvedAt       DateTime?
+  failReason       String?
+  refundRequiredAt DateTime?
+  refundReason     String?
+  refundAmount     Int           @default(0)
+
+  orders Order[]
+
+  @@index([buyerId])
+}
+
+model ListingImage {
+  id        String  @id @default(cuid())
+  listing   Listing @relation(fields: [listingId], references: [id])
+  listingId String
+  url       String
+  sortOrder Int     @default(0)
+}
+
+// Prisma enum identifiers use ASCII names; @map preserves the design's Korean DB values.
+enum ShippingStatus {
+  PREPARING           @map("배송준비중")
+  TRACKING_REGISTERED @map("송장번호입력")
+  SHIPPED             @map("발송완료")
+  DELIVERED           @map("배송완료")
+}
+
+model Order {
+  id             String         @id @default(cuid())
+  // 사람이 읽는 주문번호 (예: 20260824-0003). id(cuid)는 URL·외래키용 내부
+  // 식별자로만 남기고, 화면·CS·계산서에는 이 값을 쓴다 — 고객이 전화로
+  // "cmt6kgb1p..."를 불러줄 수는 없기 때문. 날짜는 KST 기준, 순번은 당일
+  // 생성 순서. 생성은 createBuyerOrders 가 트랜잭션 안에서 당일 건수+1 로
+  // 만들고, 동시 주문이 같은 번호를 잡으면 unique 가 P2002 로 막아 전체
+  // 트랜잭션을 되돌린 뒤 재시도한다(재고 차감도 함께 롤백되므로 안전).
+  // nullable 인 이유: 이 컬럼 이전의 주문은 마이그레이션이 백필하지만,
+  // 표시는 orderNo ?? id 로 방어한다.
+  orderNo        String?        @unique
+  buyer          User           @relation(fields: [buyerId], references: [id])
+  buyerId        String
+  listing        Listing        @relation(fields: [listingId], references: [id])
+  listingId      String
+  sellerId       String
+  quantity       Int
+  unitPrice      Int
+  extraShipping  Int            @default(0)
+  status         String
+  cancelReason   String?
+  shippingStatus ShippingStatus @default(PREPARING)
+  courier        String?
+  trackingNumber String?
+  shippedAt      DateTime?
+  deliveredAt    DateTime?
+  orderedAt      DateTime       @default(now())
+  // Deadline for lazy expiry of an unpaid (입금대기) order — see
+  // UNPAID_ORDER_TTL_MS in src/lib/server/orders.ts. Set to orderedAt + TTL at
+  // creation and refreshed to now + TTL by /api/payments/toss/prepare, so a
+  // buyer who opens the Toss payment sheet just before the original deadline
+  // isn't expired mid-checkout. Rows that predate this column were backfilled
+  // to orderedAt + TTL by the migration, but only while still 입금대기 — a
+  // NULL here therefore means "not awaiting payment", and expiry only ever
+  // reads this field while status is PAYMENT_PENDING anyway.
+  paymentDeadline DateTime?
+  paymentId      String?
+  payment        Payment?       @relation(fields: [paymentId], references: [id])
+
+  // 배송지 스냅샷. 주문 시점에 확정해 저장한다 — 예전에는 판매자가
+  // User.postalCode/address 를 직접 읽었기 때문에, 회원정보를 고치면 이미
+  // 발송된 주문의 배송지까지 소급해서 바뀌었고 지점이 여럿인 사업자는
+  // 주문마다 다른 곳으로 받을 방법이 아예 없었다.
+  // 이 컬럼이 생기기 전 주문은 마이그레이션이 User 값으로 백필했고, 그래서
+  // nullable 이다. 새 주문은 체크아웃에서 항상 채운다.
+  recipientName   String?
+  recipientPhone  String?
+  postalCode      String?
+  address         String?
+  addressDetail   String?
+  deliveryNote    String?
+
+  // 주문 시점에 확정된 기본 배송비(Seller.shippingFee 의 스냅샷).
+  // extraShipping 은 그와 별개인 도서산간 등 추가분으로 남겨 둔다.
+  shippingFee     Int  @default(0)
+
+  settlement   Settlement? @relation(fields: [settlementId], references: [id])
+  settlementId String?
+
+  review               Review?
+  returnRequest        ReturnRequest?
+  settlementAdjustment SettlementAdjustment?
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([listingId])
+  @@index([paymentId])
+  @@index([status, paymentDeadline])
+  @@index([settlementId])
+}
+
+model CartItem {
+  id             String   @id @default(cuid())
+  user           User     @relation(fields: [userId], references: [id])
+  userId         String
+  tireId         String
+  manufacturer   String
+  model          String
+  width          Int
+  ratio          Int
+  rim            Int
+  dot            String
+  price          Int
+  quantity       Int
+  extraShipping  Int
+  sellerCode     String
+  stock          Int?
+  listing        Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+  listingId      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([userId])
+  @@index([listingId])
+  @@unique([userId, tireId, sellerCode, dot])
+}
+
+model WishlistEntry {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  type      String
+  code      String
+  location  String
+  intro     String
+  wishedAt  DateTime @default(now())
+
+  @@index([userId])
+  @@unique([userId, code])
+}
+
+// ---------------------------------------------------------------------------
+// 배송지 주소록
+// ---------------------------------------------------------------------------
+// 사업자는 지점이 여럿인 경우가 흔한데, 예전에는 배송지가 User 에 붙은 주소
+// 하나뿐이라 이번 주문만 다른 지점으로 받는 것이 불가능했다. 체크아웃에서
+// 여기 저장된 주소를 고르거나 새로 입력하고, 고른 값은 Order 에 스냅샷된다.
+model ShippingAddress {
+  id             String   @id @default(cuid())
+  user           User     @relation(fields: [userId], references: [id])
+  userId         String
+  label          String
+  recipientName  String
+  recipientPhone String
+  postalCode     String
+  address        String
+  addressDetail  String?
+  isDefault      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// 판매자 정산
+// ---------------------------------------------------------------------------
+enum SettlementStatus {
+  PENDING
+  CONFIRMED
+  PAID
+}
+
+// 한 판매자의 한 정산 주기. 금액은 전부 정산 확정 시점의 스냅샷이다 —
+// 나중에 수수료율이나 주문이 바뀌어도 이미 지급한 정산서가 흔들리면 안 된다.
+// netAmount = grossAmount - commissionAmount + adjustmentAmount 이며, 계산
+// 결과가 아니라 확정값을 저장한다. adjustmentAmount 는 이 정산 확정 시점에
+// 흡수한 미반영 SettlementAdjustment(클로백) 합계(0 이하)다 — 이 컬럼이
+// 생기기 전에는 흡수할 클로백 자체가 없었으므로 기본값 0, 즉
+// netAmount = grossAmount - commissionAmount 그대로가 기존 정산 행에도 그대로
+// 유지된다. 자세한 계산은 SettlementAdjustment/createSettlementClawbackForOrder
+// (payout.ts) 참고.
+model Settlement {
+  id               String           @id @default(cuid())
+  seller           Seller           @relation(fields: [sellerId], references: [id])
+  sellerId         String
+  periodStart      DateTime
+  periodEnd        DateTime
+  grossAmount      Int
+  commissionRate   Decimal          @db.Decimal(5, 2)
+  commissionAmount Int
+  adjustmentAmount Int              @default(0)
+  netAmount        Int
+  status           SettlementStatus @default(PENDING)
+  memo             String?
+  confirmedAt      DateTime?
+  paidAt           DateTime?
+  createdAt        DateTime         @default(now())
+
+  orders      Order[]
+  adjustments SettlementAdjustment[]
+
+  @@index([sellerId, status])
+}
+
+// 정산·지급이 끝난 주문이 나중에 반품 완료되거나(returns.ts) 관리자에 의해
+// 취소되면(orders.ts cancelOrder 의 입금후취소 경로), 판매자에게 이미
+// 지급된 돈을 되돌려야 한다 — 하지만 그 지급은 이미 커밋된 Settlement 행에
+// 스냅샷돼 있으므로 그 행 자체를 고칠 수 없다(위 주석대로 "확정값"이다).
+// 대신 이 회수(클로백)를 별도 행으로 기록해 두었다가, 다음 confirmPayout
+// 확정 때 새 Settlement 의 adjustmentAmount 로 흡수한다 — payout.ts의
+// createSettlementClawbackForOrder / confirmPayout 참고.
+model SettlementAdjustment {
+  id       String @id @default(cuid())
+  seller   Seller @relation(fields: [sellerId], references: [id])
+  sellerId String
+  order    Order  @relation(fields: [orderId], references: [id])
+  // 흐름상 주문 하나가 정산 후 취소/반품될 수 있는 경로는 한 번뿐이지만,
+  // orderId 를 @unique 로 못박아 두면 로직이 회귀해도 조용한 이중 회수
+  // 대신 P2002 로 시끄럽게 실패한다.
+  orderId String @unique
+  // 음수 = 회수(클로백). 지금은 회수만 만들지만 부호를 필드에 고정하지
+  // 않은 이유는 나중에 반대 방향(추가 지급 조정)이 생겨도 같은 테이블을
+  // 재사용할 수 있게 하기 위함이다.
+  amount    Int
+  reason    String
+  createdAt DateTime @default(now())
+
+  // null = 아직 어떤 정산에도 흡수되지 않음 — 다음 confirmPayout 확정 때
+  // 흡수된다(payout.ts). 흡수되고 나면 그 Settlement 를 가리킨다.
+  settlement   Settlement? @relation(fields: [settlementId], references: [id])
+  settlementId String?
+
+  @@index([sellerId, settlementId])
+}
+
+// ---------------------------------------------------------------------------
+// 리뷰
+// ---------------------------------------------------------------------------
+// 주문 1건당 최대 1개. orderId 가 @unique 인 것이 그 제약이고, 동시에
+// "구매한 사람만 쓸 수 있다"는 보장이기도 하다 — 주문 없이는 리뷰가 존재할 수
+// 없다. 작성 가능 시점(배송완료 이후)은 애플리케이션에서 강제한다.
+model Review {
+  id        String   @id @default(cuid())
+  order     Order    @relation(fields: [orderId], references: [id])
+  orderId   String   @unique
+  buyer     User     @relation(fields: [buyerId], references: [id])
+  buyerId   String
+  seller    Seller   @relation(fields: [sellerId], references: [id])
+  sellerId  String
+  listingId String
+  rating    Int
+  content   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId])
+  @@index([listingId])
+}
+
+// ---------------------------------------------------------------------------
+// 1:1 문의 / 상품 문의
+// ---------------------------------------------------------------------------
+enum InquiryStatus {
+  OPEN
+  ANSWERED
+  CLOSED
+}
+
+// listingId 가 있으면 상품 문의, 없으면 일반 1:1 문의다. 답변은 별도 테이블
+// 없이 여기 담는다 — 이 서비스의 문의는 한 번 묻고 한 번 답하는 형태이고,
+// 스레드가 필요해지면 그때 분리하는 편이 낫다.
+model Inquiry {
+  id         String        @id @default(cuid())
+  user       User          @relation(fields: [userId], references: [id])
+  userId     String
+  listingId  String?
+  category   String
+  title      String
+  content    String
+  status     InquiryStatus @default(OPEN)
+  answer     String?
+  answeredAt DateTime?
+  answeredBy String?
+  createdAt  DateTime      @default(now())
+
+  @@index([userId])
+  @@index([status])
+  @@index([listingId])
+}
+
+// ---------------------------------------------------------------------------
+// 교환 / 반품
+// ---------------------------------------------------------------------------
+enum ReturnType {
+  EXCHANGE
+  RETURN
+}
+
+enum ReturnStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+// 주문 1건당 최대 1건. COMPLETED 로 넘어갈 때 애플리케이션이 Order.status 를
+// 교환완료/반품완료(CANCEL_STATUS)로 옮긴다 — 그 상태값들은 order-status.ts 에
+// 정의만 되어 있고 지금까지 아무도 세팅하지 않았다.
+model ReturnRequest {
+  id           String       @id @default(cuid())
+  order        Order        @relation(fields: [orderId], references: [id])
+  orderId      String       @unique
+  buyer        User         @relation(fields: [buyerId], references: [id])
+  buyerId      String
+  sellerId     String
+  type         ReturnType
+  reason       String
+  detail       String?
+  status       ReturnStatus @default(REQUESTED)
+  rejectReason String?
+  requestedAt  DateTime     @default(now())
+  processedAt  DateTime?
+  processedBy  String?
+
+  @@index([buyerId])
+  @@index([sellerId, status])
+}
+
+// ---------------------------------------------------------------------------
+// 세금계산서
+// ---------------------------------------------------------------------------
+enum TaxInvoiceStatus {
+  REQUESTED
+  ISSUED
+  REJECTED
+  CANCELED
+}
+
+// 사업자 전용 서비스라 세금계산서는 부가기능이 아니라 결제 조건에 가깝다.
+// 다만 국세청/팝빌 연동은 없으므로 이 테이블은 "신청 접수 → 관리자가 외부에서
+// 발행 → 결과 기록"까지만 다룬다. externalId 는 실제 발행 시스템의 승인번호를
+// 적어 두는 자리이고, 연동이 붙으면 그대로 쓰면 된다.
+// 금액은 신청 시점에 확정해 저장한다 — 나중에 주문이 취소돼도 이미 발행된
+// 계산서의 금액이 바뀌면 안 되기 때문이다.
+model TaxInvoice {
+  id           String           @id @default(cuid())
+  user         User             @relation(fields: [userId], references: [id])
+  userId       String
+  periodMonth  String
+  supplyAmount Int
+  vat          Int
+  totalAmount  Int
+  status       TaxInvoiceStatus @default(REQUESTED)
+  externalId   String?
+  issuedAt     DateTime?
+  issuedBy     String?
+  rejectReason String?
+  requestedAt  DateTime         @default(now())
+
+  @@unique([userId, periodMonth])
+  @@index([status])
+}

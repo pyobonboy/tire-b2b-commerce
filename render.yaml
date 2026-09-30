@@ -1,0 +1,62 @@
+databases:
+  - name: tire-b2b-db
+    plan: free
+
+services:
+  - type: web
+    name: tire-b2b-app
+    runtime: node
+    plan: free
+    healthCheckPath: /api/health
+    buildCommand: npm install && rm -rf node_modules/.prisma && npx prisma generate && npx prisma migrate deploy && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.14.0
+      # Number of trusted reverse proxies in front of this app, used by
+      # getClientIp (src/lib/server/requestIp.ts) to pick the right
+      # x-forwarded-for hop for rate-limit bucketing. Render alone in front
+      # is 1 hop — this documents and preserves that existing behavior
+      # explicitly. Bump to 2 only if a CDN (e.g. Cloudflare) is added in
+      # front of Render.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tire-b2b-db
+          property: externalConnectionString
+      # Referenced by prisma/schema.prisma's datasource.directUrl. Without
+      # it, Render's build (prisma generate/migrate deploy) fails with
+      # "Environment variable not found: DIRECT_URL". Render has no
+      # connection pooler in front of this DB, so it's set to the same
+      # value as DATABASE_URL.
+      - key: DIRECT_URL
+        fromDatabase:
+          name: tire-b2b-db
+          property: externalConnectionString
+      - key: NEXTAUTH_SECRET
+        generateValue: true
+      - key: NEXTAUTH_URL
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+      - key: TOSS_CLIENT_KEY
+        sync: false
+      - key: TOSS_SECRET_KEY
+        sync: false
+      - key: TOSS_WEBHOOK_SECRET
+        sync: false
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: S3_PUBLIC_BASE_URL
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        value: auto
+      - key: S3_FORCE_PATH_STYLE
+        value: "false"
